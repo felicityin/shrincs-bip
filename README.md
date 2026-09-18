@@ -9,6 +9,15 @@ This repository is the staging ground for work on the SHRINCS specification docu
 > Formal security proofs and optimized implementations are forthcoming as future work.
 
 
+## Testing
+
+Unit tests for the reference implementation live in [`impl/test.py`](./impl/test.py).
+
+```sh
+python3 -m impl.test
+```
+
+
 ## Templating
 
 The SHRINCS specification in [`SHRINCS.md`](./SHRINCS.md) includes Python reference code and documentation defined inline at [`impl/shrincs.py`](./impl/shrincs.py). We use simple templating to pull Python code and docstrings from `shrincs.py`.
