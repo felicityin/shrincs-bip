@@ -98,6 +98,19 @@ assert SHRINCS_SF_SIGNATURE_SIZE_MAX < SHRINCS_SL_SIGNATURE_SIZE
 FXMSS_SHAPE_UNBALANCED = 0
 FXMSS_SHAPE_BALANCED   = 1
 
+#  Message domain separators
+#
+#  The first byte of every bound message. It states how the payload which
+#  follows the context and the root is to be read, and keeps a signature made
+#  under one reading from verifying under another. The values match the domain
+#  separators of FIPS-205 pure and pre-hash signing.
+MSG_DOMAIN_PURE    = 0
+MSG_DOMAIN_PREHASH = 1
+
+#  DER encoding of the SHA256 object identifier 2.16.840.1.101.3.4.2.1,
+#  including its tag and length, as FIPS-205 Algorithm 23 binds it.
+PH_OID_SHA256 = bytes.fromhex("0609608648016503040201")
+
 #  ADRS type flags
 SL_WOTS_TW_HASH = 0
 SL_WOTS_TW_PK   = 1
@@ -1253,9 +1266,8 @@ def slh_dsa_digest_message(
   return (fors_digest, tree_index, leaf_index)
 
 
-def slh_dsa_sign(
+def slh_dsa_sign_internal(
     message: bytes,
-    ctx: Bytes[:255],
     sk_seed: Bytes[16],
     sk_prf: Bytes[16],
     pk_seed: Bytes[16],
@@ -1263,9 +1275,11 @@ def slh_dsa_sign(
     opt_rand: Optional[Bytes[16]],
 ) -> Bytes[SPHX_SIGNATURE_SIZE]:
   """
-  The SLH-DSA signing function. Signs `message` with `sk_seed`, prepending the context `ctx`;
-  uses `pk_seed` as the public seed, derives the randomizer from `sk_prf`/`opt_rand`, and binds the
-  signature to `sl_root`. Verifiers must use `slh_dsa_verify` with the same `ctx`.
+  The SLH-DSA internal signing function. Signs a bound `message` with `sk_seed`; uses `pk_seed`
+  as the public seed, derives the randomizer from `sk_prf`/`opt_rand`, and binds the signature to
+  `sl_root`. It prepends nothing of its own: the caller binds the message first, as
+  `shrincs_sign_internal` does. Verifiers must use `slh_dsa_verify_internal` on the same bound
+  message.
 
   When provided, `opt_rand` supplies the additional randomness used to derive the randomizer. If omitted,
   the algorithm uses `pk_seed` in its place, resulting in the _deterministic variant_ of SLH-DSA.
@@ -1274,8 +1288,7 @@ def slh_dsa_sign(
   hypertree signature, all concatenated together.
 
   - Inputs:
-    - `message`: a variable-length message.
-    - `ctx`: a context of at most 255 bytes.
+    - `message`: a variable-length bound message.
     - `sk_seed`: a 16-byte secret.
     - `sk_prf`: a 16-byte secret.
     - `pk_seed`: a 16-byte public seed.
@@ -1286,14 +1299,11 @@ def slh_dsa_sign(
 
   This function is only used in the stateless path, and only by the signer.
   """
-  assert len(ctx) < 256
-  contextualized_msg = (0).to_bytes(1) + len(ctx).to_bytes(1) + ctx + message
-
   if opt_rand is None:
     opt_rand = pk_seed # deterministic mode
 
-  R = PRF_msg_sl(sk_prf, opt_rand, contextualized_msg)
-  fors_digest, tree_index, leaf_index = slh_dsa_digest_message(R, pk_seed, sl_root, contextualized_msg)
+  R = PRF_msg_sl(sk_prf, opt_rand, message)
+  fors_digest, tree_index, leaf_index = slh_dsa_digest_message(R, pk_seed, sl_root, message)
 
   ADRS = bytearray(22)
   ADRS[1:9] = tree_index.to_bytes(8)
@@ -1305,23 +1315,22 @@ def slh_dsa_sign(
 
   return R + fors_signature + hypertree_signature
 
-def slh_dsa_verify(
+def slh_dsa_verify_internal(
     message: bytes,
     signature: bytes,
-    ctx: Bytes[:255],
     pk_seed: Bytes[16],
     sl_root: Bytes[16],
 ) -> bool:
   """
-  The SLH-DSA verification function. Recovers the root-tree root from a `signature` on `message`
-  (with context `ctx`) and checks it against `sl_root`. Signatures must be produced via
-  `slh_dsa_sign` with the same `ctx`.
+  The SLH-DSA internal verification function. Recovers the root-tree root from a `signature` on a
+  bound `message` and checks it against `sl_root`. It prepends nothing of its own: the caller
+  binds the message exactly as the signer did, as `shrincs_verify_internal` does. Signatures must
+  be produced via `slh_dsa_sign_internal` on the same bound message.
 
   - Inputs:
-    - `message`: a variable-length message.
+    - `message`: a variable-length bound message.
     - `signature`: a candidate signature, of any length. Any length other than
       `SPHX_SIGNATURE_SIZE` is not a signature, and is rejected.
-    - `ctx`: a context of at most 255 bytes.
     - `pk_seed`: a 16-byte public seed.
     - `sl_root`: the 16-byte root hash of the stateless root tree.
   - Output:
@@ -1329,9 +1338,6 @@ def slh_dsa_verify(
 
   This function is only used in the stateless path, and only by the verifier.
   """
-  assert len(ctx) < 256
-  contextualized_msg = (0).to_bytes(1) + len(ctx).to_bytes(1) + ctx + message
-
   if len(signature) != SPHX_SIGNATURE_SIZE:
     return False
 
@@ -1339,7 +1345,7 @@ def slh_dsa_verify(
   fors_signature = signature[16 : 16 + FORS_SIGNATURE_SIZE]
   hypertree_signature = signature[16 + FORS_SIGNATURE_SIZE : SPHX_SIGNATURE_SIZE]
 
-  fors_digest, tree_index, leaf_index = slh_dsa_digest_message(R, pk_seed, sl_root, contextualized_msg)
+  fors_digest, tree_index, leaf_index = slh_dsa_digest_message(R, pk_seed, sl_root, message)
 
   ADRS = bytearray(22)
   ADRS[1:9] = tree_index.to_bytes(8)
@@ -1436,22 +1442,37 @@ def shrincs_sf_leaf_select(
   # - no more signatures left
   return None
 
-def shrincs_sign(
-    message: Bytes[:2**61 - 384],
+def shrincs_sign_internal(
+    domain: UInt8,
     ctx: Bytes[:255],
+    payload: Bytes[:2**61 - 384],
     shrincs_seckey: Bytes[82],
     state_ctr: Optional[UInt64],
     opt_rand: Optional[Bytes[16]],
 ) -> Optional[Union[Bytes[SHRINCS_SL_SIGNATURE_SIZE],
                     Bytes[SHRINCS_SF_SIGNATURE_SIZE_MIN:SHRINCS_SF_SIGNATURE_SIZE_MAX]]]:
   """
-  The SHRINCS signing function. Signs `message` and `ctx` with the serialized secret key `shrincs_seckey`:
-  uses the stateful FXMSS path when `state_ctr` is valid for the key's tree structure, otherwise
-  falls back to the stateless SLH-DSA path. Verifiers must use `shrincs_verify` with the same `ctx`.
+  The SHRINCS internal signing function. Binds `payload` under `domain` and `ctx` and signs the
+  result with the serialized secret key `shrincs_seckey`: uses the stateful FXMSS path when
+  `state_ctr` is valid for the key's tree structure, otherwise falls back to the stateless
+  SLH-DSA path.
+
+  The bound message is `domain || len(ctx) || ctx || root || payload`, where `root` is the root
+  of the path which is not signing, so that a signature from either path commits to the whole
+  SHRINCS key pair. `shrincs_verify_internal` binds it the same way. This is the construction
+  FIPS-205 Algorithms 22 through 25 perform, differing only in that `root`.
+
+  This is the whole of SHRINCS signing. `shrincs_sign` and `hash_shrincs_sign` differ only in the
+  `domain` and `payload` they hand it, as FIPS-205 Algorithms 22 and 23 differ only in the message
+  they hand `slh_sign_internal`. A signer which holds a payload but not the message it was built
+  from, such as one given only a pre-hash digest, calls this function directly.
 
   - Inputs:
-    - `message`: a message of at most `2**61 - 384` bytes.
+    - `domain`: a domain separator, one of the `MSG_DOMAIN_*` values.
     - `ctx`: a context of at most 255 bytes.
+    - `payload`: a payload of at most `2**61 - 384` bytes. Under `MSG_DOMAIN_PURE` it is the
+      message itself; under `MSG_DOMAIN_PREHASH` it is the identifier of a pre-hash function
+      followed by the digest it produced.
     - `shrincs_seckey`: an 82-byte SHRINCS secret key.
     - `state_ctr`: a 64-bit unsigned integer, the number of stateful signatures the keypair has
       previously issued, or `None` to sign statelessly.
@@ -1472,11 +1493,12 @@ def shrincs_sign(
   > public-key generations, so implementations should reject a depth they cannot afford to compute.
 
   > [!CAUTION]
-  > Using the same key to sign different `(message, ctx)` pairs with the same `state_ctr` is
-  > a security vulnerability. SHRINCS implementations must wrap `shrincs_sign` with code
-  > which increments and saves the state counter as `state_ctr + 1` on a persistent,
+  > Using the same key to sign different `(domain, ctx, payload)` triples with the same `state_ctr`
+  > is a security vulnerability. SHRINCS implementations must wrap their signing entry point with
+  > code which increments and saves the state counter as `state_ctr + 1` on a persistent,
   > rollback-resistant storage medium before the signature is returned to the caller.
   """
+  assert len(ctx) < 256
   assert len(shrincs_seckey) == 82
   sk_seed      = shrincs_seckey[0:16]
   sk_prf       = shrincs_seckey[16:32]
@@ -1487,25 +1509,22 @@ def shrincs_sign(
 
   leaf_position = shrincs_sf_leaf_select(sf_structure, state_ctr)
 
+  # Bind the signature to the keypair of the path which is not signing, so that
+  # it commits to the whole SHRINCS keypair either way.
+  root = sf_root if leaf_position is None else sl_root
+  bound_message = domain.to_bytes(1) + len(ctx).to_bytes(1) + ctx + root + payload
+
   # Stateless signing path.
   if leaf_position is None:
-    # Bind the stateless signature to the stateful keypair.
-    return bytes([FXMSS_HEIGHT]) + slh_dsa_sign(sf_root + message, ctx, sk_seed, sk_prf, pk_seed, sl_root, opt_rand)
+    return bytes([FXMSS_HEIGHT]) + slh_dsa_sign_internal(bound_message, sk_seed, sk_prf, pk_seed, sl_root, opt_rand)
 
   # Stateful signing path.
   leaf_index, leaf_height = leaf_position
-
-  # Bind the stateful signature to the stateless keypair and context in the
-  # same manner as the stateless component.
-  assert len(ctx) < 256
-  bound_message = (0).to_bytes(1) + len(ctx).to_bytes(1) + ctx + sl_root + message
 
   ADRS = bytearray(22)
   ADRS[0] = leaf_height
   ADRS[1:9] = leaf_index.to_bytes(8)
   R = PRF_msg_sf(sk_prf, pk_seed, ADRS, bound_message)
-
-  # Bind the stateful signature to the stateless keypair.
   message_digest = H_msg_sf(R, pk_seed, sf_root, ADRS, bound_message)
   tree_balanced = sf_structure[0] == FXMSS_SHAPE_BALANCED
   fxmss_signature = fxmss_sign(message_digest, sk_seed, leaf_index, leaf_height, pk_seed, tree_balanced, sf_structure[1])
@@ -1518,38 +1537,50 @@ def shrincs_sign(
 
   return bytes([leaf_height]) + R + leaf_index_bytes + fxmss_signature
 
-def shrincs_verify(
-    message: Bytes[:2**61 - 384], signature: bytes, ctx: Bytes[:255], shrincs_pubkey: Bytes[48]
+def shrincs_verify_internal(
+    domain: UInt8,
+    ctx: Bytes[:255],
+    payload: Bytes[:2**61 - 384],
+    signature: bytes,
+    shrincs_pubkey: Bytes[48],
 ) -> bool:
   """
-  The SHRINCS verification function. Returns true iff `signature` is a valid stateful or stateless
-  SHRINCS signature on `message` under `shrincs_pubkey`. Signatures must be produced via
-  `shrincs_sign` with the same `ctx`.
+  The SHRINCS internal verification function. Returns true iff `signature` is a valid stateful or
+  stateless SHRINCS signature under `shrincs_pubkey` on `payload` bound under `domain` and `ctx`.
 
   The first byte of `signature` is called the _indicator byte_ and it tells the verifier which signing
   component to use: Byte `b == FXMSS_HEIGHT` indicates a stateless signature, any other byte `b < FXMSS_HEIGHT`
   indicates a stateful signature using a WOTS+C leaf at height `b` (i.e. depth `FXMSS_HEIGHT - b`).
 
-  The verifier recomputes `sl_root` on the stateless path and `sf_root` on the stateful path,
-  and compares the result against the public key.
+  The verifier binds `payload` exactly as the signer did, as `domain || len(ctx) || ctx || root
+  || payload`, then recomputes `sl_root` on the stateless path and `sf_root` on the stateful
+  path, and compares the result against the public key. It binds only once it knows the signature
+  is well formed, so that a signature of the wrong length is rejected without touching `payload`.
+
+  This is the whole of SHRINCS verification. `shrincs_verify` and `hash_shrincs_verify` differ
+  only in the `domain` and `payload` they hand it. A verifier which holds a payload but not the
+  message it was built from calls this function directly.
 
   This implementation validates the length of the entire signature against the indicator byte, but one
   could also stream the signature byte-by-byte during verification, allowing for signature validation
   in memory-constrained environments.
 
   - Inputs:
-    - `message`: a message of at most `2**61 - 384` bytes.
+    - `domain`: a domain separator, one of the `MSG_DOMAIN_*` values.
+    - `ctx`: a context of at most 255 bytes.
+    - `payload`: a payload of at most `2**61 - 384` bytes, as `shrincs_sign_internal` takes it.
     - `signature`: a candidate signature, of any length. The stateless path accepts exactly
       `SHRINCS_SL_SIGNATURE_SIZE` bytes. Stateful signature lengths range from
       `SHRINCS_SF_SIGNATURE_SIZE_MIN` to `SHRINCS_SF_SIGNATURE_SIZE_MAX`, and the indicator byte
       determines the exact accepted length. Every other length is rejected.
-    - `ctx`: a context of at most 255 bytes.
     - `shrincs_pubkey`: a 48-byte SHRINCS public key.
   - Output:
     - a boolean indicating if the signature is valid.
 
   This function is used only by the verifier.
   """
+  assert len(ctx) < 256
+
   if len(shrincs_pubkey) != 48:
     return False
 
@@ -1565,7 +1596,8 @@ def shrincs_verify(
   # Stateless verification path.
   if indicator == FXMSS_HEIGHT:
     # Stateless signatures must be bound to the stateful keypair.
-    return slh_dsa_verify(sf_root + message, signature[1:], ctx, pk_seed, sl_root)
+    bound_message = domain.to_bytes(1) + len(ctx).to_bytes(1) + ctx + sf_root + payload
+    return slh_dsa_verify_internal(bound_message, signature[1:], pk_seed, sl_root)
 
   # Stateful verification path. The size bounds are the FXMSS bounds plus a variable-size header.
   elif 0 <= indicator < FXMSS_HEIGHT:
@@ -1595,8 +1627,7 @@ def shrincs_verify(
 
     # Stateful signatures must be bound to the stateless keypair and context
     # in the same manner as the stateless component.
-    assert len(ctx) < 256
-    bound_message = (0).to_bytes(1) + len(ctx).to_bytes(1) + ctx + sl_root + message
+    bound_message = domain.to_bytes(1) + len(ctx).to_bytes(1) + ctx + sl_root + payload
 
     message_digest = H_msg_sf(R, pk_seed, sf_root, ADRS, bound_message)
     root = fxmss_pubkey_from_sig(leaf_index, leaf_height, fxmss_signature, message_digest, pk_seed)
@@ -1608,3 +1639,139 @@ def shrincs_verify(
   # Negative indicator, not a valid SHRINCS signature.
   else:
     return False
+
+def shrincs_sign(
+    message: Bytes[:2**61 - 384],
+    ctx: Bytes[:255],
+    shrincs_seckey: Bytes[82],
+    state_ctr: Optional[UInt64],
+    opt_rand: Optional[Bytes[16]],
+) -> Optional[Union[Bytes[SHRINCS_SL_SIGNATURE_SIZE],
+                    Bytes[SHRINCS_SF_SIGNATURE_SIZE_MIN:SHRINCS_SF_SIGNATURE_SIZE_MAX]]]:
+  """
+  The SHRINCS signing function. Signs `message` and `ctx` with the serialized secret key
+  `shrincs_seckey`, binding `message` as it is under `MSG_DOMAIN_PURE`. Verifiers must use
+  `shrincs_verify` with the same `ctx`.
+
+  This is the pure form of SHRINCS signing, and corresponds to FIPS-205 Algorithm 22. A signer
+  which cannot hold the whole message should use `hash_shrincs_sign` instead; see
+  [Pure and Pre-Hash Signing](#pure-and-pre-hash-signing).
+
+  - Inputs:
+    - `message`: a message of at most `2**61 - 384` bytes.
+    - `ctx`: a context of at most 255 bytes.
+    - `shrincs_seckey`: an 82-byte SHRINCS secret key.
+    - `state_ctr`: a 64-bit unsigned integer, the number of stateful signatures the keypair has
+      previously issued, or `None` to sign statelessly.
+    - `opt_rand`: optional 16-byte additional randomness for SLH-DSA (unused in the stateful path;
+      if omitted, the stateless path uses the deterministic variant of SLH-DSA).
+  - Output:
+    - a `SHRINCS_SL_SIGNATURE_SIZE`-byte stateless signature, or a stateful signature of at least
+      `SHRINCS_SF_SIGNATURE_SIZE_MIN` bytes and at most `SHRINCS_SF_SIGNATURE_SIZE_MAX` bytes,
+      or null.
+
+  This function is used only by the signer.
+
+  > [!CAUTION]
+  > Both warnings on `shrincs_sign_internal` apply in full to this function: the FXMSS tree
+  > structure encoded in `shrincs_seckey` must be trusted or else validated, and reusing a
+  > `state_ctr` to sign a different message is a security vulnerability.
+  """
+  return shrincs_sign_internal(MSG_DOMAIN_PURE, ctx, message, shrincs_seckey, state_ctr, opt_rand)
+
+def hash_shrincs_sign(
+    message: Bytes[:2**61 - 1],
+    ctx: Bytes[:255],
+    shrincs_seckey: Bytes[82],
+    state_ctr: Optional[UInt64],
+    opt_rand: Optional[Bytes[16]],
+) -> Optional[Union[Bytes[SHRINCS_SL_SIGNATURE_SIZE],
+                    Bytes[SHRINCS_SF_SIGNATURE_SIZE_MIN:SHRINCS_SF_SIGNATURE_SIZE_MAX]]]:
+  """
+  The SHRINCS pre-hash signing function. Signs `message` and `ctx` with the serialized secret key
+  `shrincs_seckey`, binding the SHA256 digest of `message` behind `PH_OID_SHA256` under
+  `MSG_DOMAIN_PREHASH` rather than binding `message` itself. Verifiers must use
+  `hash_shrincs_verify` with the same `ctx`.
+
+  This corresponds to FIPS-205 Algorithm 23, fixed to SHA256 as its pre-hash function. It exists
+  for signers which cannot hold the whole message: the digest may be computed elsewhere, and such
+  a signer calls `shrincs_sign_internal` with the same domain separator and payload instead. See
+  [Pure and Pre-Hash Signing](#pure-and-pre-hash-signing).
+
+  - Inputs:
+    - `message`: a message of at most `2**61 - 1` bytes.
+    - `ctx`: a context of at most 255 bytes.
+    - `shrincs_seckey`: an 82-byte SHRINCS secret key.
+    - `state_ctr`: a 64-bit unsigned integer, the number of stateful signatures the keypair has
+      previously issued, or `None` to sign statelessly.
+    - `opt_rand`: optional 16-byte additional randomness for SLH-DSA (unused in the stateful path;
+      if omitted, the stateless path uses the deterministic variant of SLH-DSA).
+  - Output:
+    - a `SHRINCS_SL_SIGNATURE_SIZE`-byte stateless signature, or a stateful signature of at least
+      `SHRINCS_SF_SIGNATURE_SIZE_MIN` bytes and at most `SHRINCS_SF_SIGNATURE_SIZE_MAX` bytes,
+      or null.
+
+  This function is used only by the signer.
+
+  > [!CAUTION]
+  > Both warnings on `shrincs_sign_internal` apply in full to this function: the FXMSS tree
+  > structure encoded in `shrincs_seckey` must be trusted or else validated, and reusing a
+  > `state_ctr` to sign a different message is a security vulnerability.
+  """
+  payload = PH_OID_SHA256 + sha256(message)
+  return shrincs_sign_internal(MSG_DOMAIN_PREHASH, ctx, payload, shrincs_seckey, state_ctr, opt_rand)
+
+def shrincs_verify(
+    message: Bytes[:2**61 - 384], signature: bytes, ctx: Bytes[:255], shrincs_pubkey: Bytes[48]
+) -> bool:
+  """
+  The SHRINCS verification function. Returns true iff `signature` is a valid stateful or stateless
+  SHRINCS signature on `message` under `shrincs_pubkey`. Signatures must be produced via
+  `shrincs_sign` with the same `ctx`.
+
+  This is the pure form of SHRINCS verification, and corresponds to FIPS-205 Algorithm 24. It
+  rejects a signature made by `hash_shrincs_sign`, because the two bind under different domain
+  separators; see [Pure and Pre-Hash Signing](#pure-and-pre-hash-signing).
+
+  - Inputs:
+    - `message`: a message of at most `2**61 - 384` bytes.
+    - `signature`: a candidate signature, of any length. The stateless path accepts exactly
+      `SHRINCS_SL_SIGNATURE_SIZE` bytes. Stateful signature lengths range from
+      `SHRINCS_SF_SIGNATURE_SIZE_MIN` to `SHRINCS_SF_SIGNATURE_SIZE_MAX`, and the indicator byte
+      determines the exact accepted length. Every other length is rejected.
+    - `ctx`: a context of at most 255 bytes.
+    - `shrincs_pubkey`: a 48-byte SHRINCS public key.
+  - Output:
+    - a boolean indicating if the signature is valid.
+
+  This function is used only by the verifier.
+  """
+  return shrincs_verify_internal(MSG_DOMAIN_PURE, ctx, message, signature, shrincs_pubkey)
+
+def hash_shrincs_verify(
+    message: Bytes[:2**61 - 1], signature: bytes, ctx: Bytes[:255], shrincs_pubkey: Bytes[48]
+) -> bool:
+  """
+  The SHRINCS pre-hash verification function. Returns true iff `signature` is a valid stateful or
+  stateless SHRINCS signature on the SHA256 digest of `message` under `shrincs_pubkey`. Signatures
+  must be produced via `hash_shrincs_sign` with the same `ctx`.
+
+  This corresponds to FIPS-205 Algorithm 25. It rejects a signature made by `shrincs_sign`,
+  because the two bind under different domain separators; see
+  [Pure and Pre-Hash Signing](#pure-and-pre-hash-signing).
+
+  - Inputs:
+    - `message`: a message of at most `2**61 - 1` bytes.
+    - `signature`: a candidate signature, of any length. The stateless path accepts exactly
+      `SHRINCS_SL_SIGNATURE_SIZE` bytes. Stateful signature lengths range from
+      `SHRINCS_SF_SIGNATURE_SIZE_MIN` to `SHRINCS_SF_SIGNATURE_SIZE_MAX`, and the indicator byte
+      determines the exact accepted length. Every other length is rejected.
+    - `ctx`: a context of at most 255 bytes.
+    - `shrincs_pubkey`: a 48-byte SHRINCS public key.
+  - Output:
+    - a boolean indicating if the signature is valid.
+
+  This function is used only by the verifier.
+  """
+  payload = PH_OID_SHA256 + sha256(message)
+  return shrincs_verify_internal(MSG_DOMAIN_PREHASH, ctx, payload, signature, shrincs_pubkey)
